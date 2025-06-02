@@ -375,15 +375,195 @@ private class AsyncResource : IAsyncDisposable
 * Полезно для асинхронного закрытия или очистки ресурсов (сетевые потоки, подключение к БД и т.д.).
 
 ---
+## 11. Async File I/O
+
+```csharp
+private async Task DemoFileIOAsync()
+{
+    Console.WriteLine("\n-- 11) Async File I/O --");
+
+    string filePath = Path.Combine(Environment.CurrentDirectory, "demo_async_io.txt");
+
+    // 11.1: Асинхронная запись текста полностью
+    string contentToWrite = "Это демонстрация асинхронной работы с файлами.\nTimestamp: " + DateTime.UtcNow.ToString("O");
+    await File.WriteAllTextAsync(filePath, contentToWrite).ConfigureAwait(false);
+    Console.WriteLine($"Записали текст в файл: {filePath}");
+
+    // 11.2: Асинхронное чтение всего файла
+    string readAll = await File.ReadAllTextAsync(filePath).ConfigureAwait(false);
+    Console.WriteLine("Прочитано содержимое файла:");
+    Console.WriteLine(readAll);
+
+    // 11.3: Асинхронные FileStream чтение/запись
+    string streamFile = Path.Combine(Environment.CurrentDirectory, "demo_async_stream.bin");
+    byte[] data = new byte[1024];
+    new Random().NextBytes(data);
+
+    await using (var fsWrite = new FileStream(streamFile, FileMode.Create, FileAccess.Write, FileShare.None, 4096, useAsync: true))
+    {
+        await fsWrite.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
+        Console.WriteLine($"Записали {data.Length} байт в {streamFile}");
+    }
+
+    await using (var fsRead = new FileStream(streamFile, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true))
+    {
+        byte[] buffer = new byte[data.Length];
+        int bytesRead = await fsRead.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+        Console.WriteLine($"Прочитали {bytesRead} байт из {streamFile}");
+    }
+
+    // 11.4: Асинхронная обработка больших файлов с отменой
+    using CancellationTokenSource cts = new CancellationTokenSource();
+    var largeFile = Path.Combine(Environment.CurrentDirectory, "large_demo.txt");
+    // Сгенерируем файл, если его нет
+    if (!File.Exists(largeFile))
+    {
+        using (var w = new StreamWriter(largeFile))
+        {
+            for (int i = 0; i < 100_000; i++)
+                await w.WriteLineAsync($"Строка номер {i}").ConfigureAwait(false);
+        }
+    }
+
+    Console.WriteLine("Начинаем асинхронное чтение большого файла...");
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(200).ConfigureAwait(false);
+        Console.WriteLine("Запрашиваю отмену чтения большого файла...");
+        cts.Cancel();
+    });
+
+    try
+    {
+        await using (var reader = new StreamReader(largeFile))
+        {
+            string? line;
+            int counter = 0;
+            while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) != null)
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                if (++counter % 20000 == 0)
+                    Console.WriteLine($"Прочитано {counter} строк...");
+            }
+            Console.WriteLine("Чтение большого файла завершено успешно.");
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("Чтение большого файла отменено пользователем.");
+    }
+}
+```
+
+В этом разделе:
+
+* **File.WriteAllTextAsync / File.ReadAllTextAsync** — простая запись и чтение всего текста.
+* **FileStream с флагом useAsync: true** — потоковое чтение/запись бинарных данных.
+* **Асинхронная обработка большого файла** с проверкой `CancellationToken`:
+
+  * Генерация файла, если отсутствует;
+  * Чтение построчно через `ReadLineAsync`;
+  * Отмена чтения при запросе `cts.Cancel()`.
+
+---
+
+## 12. Async Database Access (SQLite)
+
+```csharp
+private async Task DemoDatabaseAsync()
+{
+    Console.WriteLine("\n-- 12) Async Database Access (SQLite) --");
+
+    string dbPath = Path.Combine(Environment.CurrentDirectory, "async_demo.db");
+    string connectionString = new SqliteConnectionStringBuilder
+    {
+        DataSource = dbPath,
+        Mode = SqliteOpenMode.ReadWriteCreate
+    }.ToString();
+
+    // 12.1: Создание БД и таблицы, если ещё нет
+    await using (var connection = new SqliteConnection(connectionString))
+    {
+        await connection.OpenAsync().ConfigureAwait(false);
+
+        string createTableSql = @"
+        CREATE TABLE IF NOT EXISTS Users (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Name TEXT NOT NULL,
+            CreatedAt TEXT NOT NULL
+        );";
+        await using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = createTableSql;
+            await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+
+        // 12.2: Вставка нескольких записей асинхронно с транзакцией
+        await using (var transaction = await connection.BeginTransactionAsync().ConfigureAwait(false))
+        {
+            for (int i = 1; i <= 5; i++)
+            {
+                var insertCmd = connection.CreateCommand();
+                insertCmd.CommandText = "INSERT INTO Users (Name, CreatedAt) VALUES ($name, $createdAt);";
+                insertCmd.Parameters.AddWithValue("$name", $"User_{i}");
+                insertCmd.Parameters.AddWithValue("$createdAt", DateTime.UtcNow.ToString("O"));
+                insertCmd.Transaction = transaction;
+
+                await insertCmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                Console.WriteLine($"Inserted User_{i}");
+            }
+
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+
+        // 12.3: Асинхронное чтение данных
+        Console.WriteLine("Чтение данных из таблицы Users:");
+        string selectSql = "SELECT Id, Name, CreatedAt FROM Users;";
+        await using (var selectCmd = connection.CreateCommand())
+        {
+            selectCmd.CommandText = selectSql;
+            await using (var reader = await selectCmd.ExecuteReaderAsync().ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync().ConfigureAwait(false))
+                {
+                    long id = reader.GetInt64(0);
+                    string name = reader.GetString(1);
+                    string createdAt = reader.GetString(2);
+                    Console.WriteLine($"Id={id}, Name={name}, CreatedAt={createdAt}");
+                }
+            }
+        }
+
+        await connection.CloseAsync().ConfigureAwait(false);
+    }
+}
+```
+
+В этом разделе:
+
+1. **Настройка SQLite-подключения** через `SqliteConnectionStringBuilder`.
+2. **Создание таблицы** при первом запуске (IF NOT EXISTS).
+3. **Транзакционная вставка нескольких записей** с параметризованными SQL-командами (`$name`, `$createdAt`).
+4. **Асинхронное чтение** через `ExecuteReaderAsync` и `ReadAsync`.
+
+> **Важно:**
+>
+> * Для работы этого кода нужно добавить NuGet-пакет `Microsoft.Data.Sqlite`.
+> * Поддерживаются все основные операции: создание схемы, вставка, выборка.
+
+---
 
 ## Как использовать
 
-1. В `Program.cs` достаточно вызвать:
+В `Program.cs` достаточно вызвать:
 
    ```csharp
    new AsyncAwaitDemo().Run();
    ```
 
-2. При запуске консоли вы увидите пошаговую демонстрацию всех перечисленных техник.
+При запуске:
 
+1. Вы последовательно увидите демонстрацию каждой техники async/await.
+2. Будут созданы файлы `demo_async_io.txt`, `demo_async_stream.bin` и `large_demo.txt` (если их нет).
+3. Будет создана SQLite БД `async_demo.db` и таблица `Users` (если её нет), после чего вставятся записи и выведутся на консоль.
 ---
